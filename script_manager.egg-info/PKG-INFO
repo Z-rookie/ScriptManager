@@ -1,0 +1,12 @@
+Metadata-Version: 2.4
+Name: script-manager
+Version: 0.1.0
+Summary: 管理Ubuntu服务器上运行的脚本程序
+Author: ScriptManager
+Requires-Python: >=3.6
+Requires-Dist: psutil>=5.9.0
+Requires-Dist: tabulate>=0.8.10
+Dynamic: author
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
