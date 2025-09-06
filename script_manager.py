@@ -55,12 +55,23 @@ def get_process_ports(pid):
         return ""
         
     try:
-        # 获取进程及其子进程的PID列表
+        # 获取进程及其所有子进程的PID列表（递归获取）
         pids = [str(pid)]
         try:
             process = psutil.Process(pid)
-            for child in process.children(recursive=True):
-                pids.append(str(child.pid))
+            # 递归获取所有子进程和孙进程
+            def get_all_children(proc):
+                children_pids = []
+                try:
+                    for child in proc.children(recursive=False):
+                        children_pids.append(str(child.pid))
+                        # 递归获取子进程的子进程
+                        children_pids.extend(get_all_children(child))
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+                return children_pids
+            
+            pids.extend(get_all_children(process))
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
         
@@ -93,6 +104,39 @@ def get_process_ports(pid):
                     return ",".join(map(str, ports))
                 else:
                     return f"{ports[0]},+{len(ports)-1}more"
+        
+        # 如果ss命令没有找到端口，尝试使用netstat作为备选方案
+        if not ports:
+            try:
+                result = subprocess.run(['netstat', '-tlnp'], capture_output=True, text=True)
+                if result.returncode == 0:
+                    for line in result.stdout.splitlines():
+                        if 'LISTEN' in line:
+                            for p in pids:
+                                if f'{p}/' in line:
+                                    parts = line.split()
+                                    if len(parts) >= 4:
+                                        addr = parts[3]
+                                        if ':' in addr:
+                                            port_str = addr.split(':')[-1]
+                                            try:
+                                                port = int(port_str)
+                                                ports.append(port)
+                                            except ValueError:
+                                                pass
+                                    break
+                    
+                    if ports:
+                        ports = sorted(list(set(ports)))
+                        if len(ports) == 1:
+                            return str(ports[0])
+                        elif len(ports) <= 3:
+                            return ",".join(map(str, ports))
+                        else:
+                            return f"{ports[0]},+{len(ports)-1}more"
+            except Exception:
+                pass
+                
     except Exception:
         pass
     
@@ -118,6 +162,23 @@ def list_scripts(args):
         ports_str = ""
         if status == "running" and pid:
             ports_str = get_process_ports(pid)
+            
+            # 如果没有检测到端口，但进程是运行状态，可能是服务还在启动中
+            # 对于刚启动的进程（启动时间少于30秒），进行重试检测
+            if not ports_str:
+                started_at = script.get("started_at")
+                if started_at:
+                    try:
+                        start_time = datetime.strptime(started_at, "%Y-%m-%d %H:%M:%S")
+                        current_time = datetime.now()
+                        time_diff = (current_time - start_time).total_seconds()
+                        
+                        # 如果进程启动时间少于30秒，等待2秒后重试检测端口
+                        if time_diff < 30:
+                            time.sleep(2)
+                            ports_str = get_process_ports(pid)
+                    except (ValueError, TypeError):
+                        pass
         
         table_data.append([
             script_id,
@@ -265,6 +326,105 @@ def view_logs(args):
     lines = args.lines or 10
     subprocess.run(["tail", "-n", str(lines), log_file])
 
+def refresh_ports(args):
+    """刷新端口检测"""
+    config = load_config()
+    scripts = config.get("scripts", {})
+    
+    if not scripts:
+        print("没有注册的脚本")
+        return
+    
+    print("正在刷新端口检测...")
+    
+    # 如果指定了脚本ID，只刷新该脚本
+    if hasattr(args, 'id') and args.id:
+        if args.id not in scripts:
+            print(f"找不到ID为 {args.id} 的脚本")
+            return
+        
+        script = scripts[args.id]
+        pid = script.get("pid", 0)
+        status = get_script_status(pid)
+        
+        if status == "running" and pid:
+            print(f"检测脚本 {args.id} (PID: {pid}) 的端口...")
+            
+            # 智能等待端口绑定
+            ports_str = wait_for_port_binding(pid, script.get("name", ""), max_wait=60)
+            
+            if ports_str:
+                print(f"脚本 {args.id} 检测到端口: {ports_str}")
+            else:
+                print(f"脚本 {args.id} 未检测到端口")
+        else:
+            print(f"脚本 {args.id} 未在运行")
+    else:
+        # 刷新所有运行中的脚本
+        running_count = 0
+        for script_id, script in scripts.items():
+            pid = script.get("pid", 0)
+            status = get_script_status(pid)
+            
+            if status == "running" and pid:
+                running_count += 1
+                print(f"检测脚本 {script_id} (PID: {pid}) 的端口...")
+                time.sleep(1)  # 短暂延迟避免过于频繁的检测
+                ports_str = get_process_ports(pid)
+                if ports_str:
+                    print(f"  └─ 检测到端口: {ports_str}")
+                else:
+                    print(f"  └─ 未检测到端口")
+        
+        if running_count == 0:
+            print("没有运行中的脚本")
+        else:
+            print(f"\n已完成 {running_count} 个脚本的端口检测")
+    
+    print("\n端口检测完成，使用 'sm ps' 查看最新状态")
+
+def wait_for_port_binding(pid, script_name="", max_wait=60):
+    """智能等待端口绑定"""
+    print(f"等待服务启动并绑定端口 (最多等待 {max_wait} 秒)...")
+    
+    start_time = time.time()
+    check_interval = 3  # 每3秒检查一次
+    
+    while time.time() - start_time < max_wait:
+        # 检查进程是否还在运行
+        if get_script_status(pid) != "running":
+            print("进程已停止")
+            return ""
+        
+        # 检查端口
+        ports_str = get_process_ports(pid)
+        if ports_str:
+            elapsed = int(time.time() - start_time)
+            print(f"服务已启动！用时 {elapsed} 秒")
+            return ports_str
+        
+        # 显示进度
+        elapsed = int(time.time() - start_time)
+        print(f"等待中... ({elapsed}/{max_wait}s)")
+        
+        # 对于install.sh这类脚本，检查是否已经到了启动Python服务的阶段
+        if "install.sh" in script_name or "install" in script_name.lower():
+            try:
+                # 检查进程树中是否有python进程
+                result = subprocess.run(['pstree', '-p', str(pid)], 
+                                      capture_output=True, text=True)
+                if result.returncode == 0 and 'python' in result.stdout:
+                    print("检测到Python进程，继续等待端口绑定...")
+                    # 如果检测到Python进程，延长等待时间
+                    check_interval = 5
+            except Exception:
+                pass
+        
+        time.sleep(check_interval)
+    
+    print(f"等待超时 ({max_wait} 秒)，未检测到端口")
+    return ""
+
 def run_script_directly(args):
     """直接运行脚本并在后台管理"""
     # 生成一个唯一ID
@@ -359,6 +519,7 @@ ScriptManager (sm) - 脚本管理器
   sm restart <id>                  重启脚本
   sm rm <id>                       删除脚本
   sm logs <id> [-n lines]          查看脚本日志
+  sm refresh [id]                  刷新端口检测 (可选指定脚本ID)
   sm help                          显示此帮助信息
 
 示例:
@@ -367,6 +528,8 @@ ScriptManager (sm) - 脚本管理器
   sm ps                            查看所有脚本状态
   sm stop abc123                   停止ID为abc123的脚本
   sm logs abc123 -n 50             查看脚本最后50行日志
+  sm refresh                       刷新所有脚本的端口检测
+  sm refresh abc123                刷新指定脚本的端口检测
 """
     print(help_text)
 
@@ -375,7 +538,7 @@ def main():
     ensure_dirs()
     
     # 检查是否是直接运行脚本的情况
-    if len(sys.argv) > 1 and not sys.argv[1] in ['help', 'ps', 'start', 'stop', 'restart', 'rm', 'logs']:
+    if len(sys.argv) > 1 and not sys.argv[1] in ['help', 'ps', 'start', 'stop', 'restart', 'rm', 'logs', 'refresh']:
         # 直接运行脚本模式
         parser = argparse.ArgumentParser(description="脚本管理器 - 直接运行脚本")
         parser.add_argument("script_path", help="要运行的脚本路径")
@@ -423,6 +586,11 @@ def main():
     logs_parser.add_argument("id", help="脚本ID")
     logs_parser.add_argument("-n", "--lines", type=int, help="显示的行数")
     logs_parser.set_defaults(func=view_logs)
+    
+    # refresh命令
+    refresh_parser = subparsers.add_parser("refresh", help="刷新端口检测")
+    refresh_parser.add_argument("id", nargs="?", help="脚本ID (可选，不指定则刷新所有)")
+    refresh_parser.set_defaults(func=refresh_ports)
     
     args = parser.parse_args()
     

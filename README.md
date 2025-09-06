@@ -1,4 +1,4 @@
-# ScriptManager (sm) - 脚本管理器
+qing# ScriptManager (sm) - 脚本管理器
 
 一个用于管理和监控服务器上运行脚本的命令行工具。
 
